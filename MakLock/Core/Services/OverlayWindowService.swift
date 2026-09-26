@@ -1,236 +1,471 @@
 import AppKit
 import SwiftUI
+import CoreGraphics
+import ApplicationServices
 
-/// Manages overlay window lifecycle: show, hide, and timeout failsafe.
+/// Manages the small lock card and the window-sized blocker.
 final class OverlayWindowService {
+
     static let shared = OverlayWindowService()
 
-    private var overlayWindows: [LockOverlayWindow] = []
+    private var overlayWindow: LockOverlayWindow?
     private var timeoutTimer: Timer?
     private var currentApp: ProtectedApp?
 
-    /// Callback when overlay is dismissed after successful authentication.
-    /// Passes the name of the unlocked app.
+    /// Called after successful authentication.
     var onUnlocked: ((String) -> Void)?
 
-    private init() {
-        // Observe screen configuration changes (connect/disconnect monitors)
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(screensDidChange),
-            name: NSApplication.didChangeScreenParametersNotification,
-            object: nil
-        )
-    }
+    private init() {}
 
-    /// Show the lock overlay for a protected app on all screens.
+    // MARK: - Show / Hide
+
     func show(for app: ProtectedApp) {
-        // Don't show duplicate overlays
-        guard overlayWindows.isEmpty else { return }
+
+        guard overlayWindow == nil else {
+            return
+        }
 
         currentApp = app
 
-        // Don't hide the protected app — the overlay blur covers its content,
-        // and hiding it causes macOS to reassign app focus, which interferes
-        // with the system Touch ID dialog.
+        // First choice: cover the actual application window.
+        if let frame = protectedWindowFrame(for: app) {
 
-        createOverlayWindows(for: app)
+            createOverlayWindow(
+                for: app,
+                frame: frame
+            )
+
+        } else {
+
+            // Fallback only if Quartz cannot locate the app window.
+            // Hide the app so its content cannot remain exposed.
+            hideProtectedApp(
+                bundleIdentifier: app.bundleIdentifier
+            )
+
+            guard let screen =
+                NSScreen.main ?? NSScreen.screens.first else {
+                currentApp = nil
+                return
+            }
+
+            let size = NSSize(
+                width: 520,
+                height: 420
+            )
+
+            let frame = NSRect(
+                x: screen.visibleFrame.midX - size.width / 2,
+                y: screen.visibleFrame.midY - size.height / 2,
+                width: size.width,
+                height: size.height
+            )
+
+            createOverlayWindow(
+                for: app,
+                frame: frame
+            )
+        }
+
         startTimeoutTimer()
 
-        NSLog("[MakLock] Overlay shown for: %@", app.name)
+        NSLog(
+            "[MakLock] Lock blocker shown for %@",
+            app.name
+        )
     }
 
-    /// Hide all overlay windows.
+    /// Successful authentication.
     func hide() {
-        stopTimeoutTimer()
 
-        // Cancel any in-progress Touch ID evaluation
+        stopTimeoutTimer()
         AuthenticationService.shared.cancelAuthentication()
 
-        // Mark the app as authenticated so it won't re-lock immediately
-        if let app = currentApp {
-            AppMonitorService.shared.markAuthenticated(app.bundleIdentifier)
+        guard let app = currentApp else {
+            closeOverlayWindow()
+            return
         }
 
-        overlayWindows.forEach { $0.close() }
-        overlayWindows.removeAll()
+        let bundleID = app.bundleIdentifier
+        let name = app.name
 
-        // Activate the protected app now that overlays are gone.
-        // Small delay ensures overlay panels and Touch ID dialog are fully dismissed
-        // before attempting to bring the app forward.
-        if let bundleID = currentApp?.bundleIdentifier {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-                self?.activateProtectedApp(bundleIdentifier: bundleID)
-            }
-        }
+        AppMonitorService.shared.markAuthenticated(bundleID)
 
+        closeOverlayWindow()
         currentApp = nil
-        NSLog("[MakLock] Overlay dismissed")
+
+        // Bring the protected application back after the lock card
+        // has completely disappeared.
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + 0.12
+        ) { [weak self] in
+
+            self?.activateProtectedApp(
+                bundleIdentifier: bundleID
+            )
+        }
+
+        NSLog(
+            "[MakLock] Protected app unlocked: %@",
+            name
+        )
     }
 
-    /// Cancel the lock without authenticating the protected app.
-    /// The protected app remains unauthenticated and is hidden.
+    /// User cancelled without authenticating.
     func cancel() {
+
         stopTimeoutTimer()
         AuthenticationService.shared.cancelAuthentication()
 
         let bundleID = currentApp?.bundleIdentifier
 
-        overlayWindows.forEach { $0.close() }
-        overlayWindows.removeAll()
-        currentApp = nil
+        if let bundleID {
 
-        if let bundleID,
-           let app = NSWorkspace.shared.runningApplications.first(
-                where: { $0.bundleIdentifier == bundleID }
-           ) {
-            app.hide()
-            NSLog("[MakLock] Protected app hidden after cancel: %@", bundleID)
+            AppMonitorService.shared.cancelPendingLock(
+                for: bundleID
+            )
         }
 
-        NSLog("[MakLock] Lock cancelled; protected app remains locked")
+        closeOverlayWindow()
+        currentApp = nil
+
+        if let bundleID {
+
+            hideProtectedApp(
+                bundleIdentifier: bundleID
+            )
+        }
+
+        NSLog(
+            "[MakLock] Lock cancelled; protected app remains locked"
+        )
     }
 
-    /// Dismiss all overlays (used by panic key).
+    /// Panic / emergency dismissal.
+    /// Does NOT authenticate the protected app.
     func dismissAll() {
-        hide()
+        cancel()
     }
 
-    /// Whether an overlay is currently displayed.
     var isShowing: Bool {
-        !overlayWindows.isEmpty
+        overlayWindow != nil
     }
 
-    /// Bundle identifier of the currently locked app (if any).
     var currentBundleIdentifier: String? {
         currentApp?.bundleIdentifier
     }
 
-    /// Display name of the currently locked app (if any).
     var currentAppName: String? {
         currentApp?.name
     }
 
-    /// During Touch ID: pass through mouse events so system dialog gets interaction.
-    /// After auth: restore mouse capture for overlay blocking.
+    // MARK: - Input
+
     func setTouchIDMode(_ active: Bool) {
-        for window in overlayWindows {
-            window.ignoresMouseEvents = active
-        }
+        overlayWindow?.ignoresMouseEvents = active
     }
 
-    /// Enable key window status on overlay windows (needed for password input).
     func enableKeyboardInput() {
-        setTouchIDMode(false)
-        for window in overlayWindows {
-            window.allowKeyStatus = true
-            window.makeKeyAndOrderFront(nil)
-        }
-        NSApp.activate(ignoringOtherApps: true)
+
+        overlayWindow?.ignoresMouseEvents = false
+        overlayWindow?.makeKeyAndOrderFront(nil)
+
+        NSApp.activate(
+            ignoringOtherApps: true
+        )
     }
 
-    // MARK: - Screen Management
+    // MARK: - Window Creation
 
-    @objc private func screensDidChange(_ notification: Notification) {
-        guard !overlayWindows.isEmpty else { return }
+    private func createOverlayWindow(
+        for app: ProtectedApp,
+        frame: NSRect
+    ) {
 
-        let screens = NSScreen.screens
+        let window = LockOverlayWindow(
+            frame: frame
+        )
 
-        // Reposition existing windows to match current screens (don't recreate to avoid re-triggering Touch ID)
-        for (index, window) in overlayWindows.enumerated() {
-            if index < screens.count {
-                window.reposition(to: screens[index])
+        let view = LockOverlayView(
+            appName: app.name,
+            bundleIdentifier: app.bundleIdentifier,
+
+            onDismiss: { [weak self] in
+
+                let name =
+                    self?.currentApp?.name ?? "app"
+
+                self?.hide()
+                self?.onUnlocked?(name)
+            },
+
+            onCancel: { [weak self] in
+                self?.cancel()
             }
-        }
+        )
 
-        // Close excess windows if screens were removed
-        while overlayWindows.count > screens.count {
-            overlayWindows.removeLast().close()
-        }
+        window.contentView = NSHostingView(
+            rootView: view
+        )
 
-        // Add new windows for new screens (only blur, no Touch ID trigger)
-        if let app = currentApp {
-            for screenIndex in overlayWindows.count..<screens.count {
-                let window = LockOverlayWindow(for: screens[screenIndex])
-                let overlayView = LockOverlayView(
-                    appName: app.name,
-                    bundleIdentifier: app.bundleIdentifier,
-                    isPrimary: false,
-                    onDismiss: { [weak self] in
-                        let name = self?.currentApp?.name ?? "app"
-                        self?.hide()
-                        self?.onUnlocked?(name)
-                        },
-                        onCancel: { [weak self] in
-                            self?.cancel()
-                        }
-                )
-                window.contentView = NSHostingView(rootView: overlayView)
-                window.orderFront(nil)
-                overlayWindows.append(window)
-            }
-        }
+        overlayWindow = window
 
-        NSLog("[MakLock] Overlays repositioned for screen change (%d screens)", screens.count)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
     }
 
-    private func createOverlayWindows(for app: ProtectedApp) {
-        let primaryScreen = NSScreen.main ?? NSScreen.screens.first
+    private func closeOverlayWindow() {
 
-        for screen in NSScreen.screens {
-            let window = LockOverlayWindow(for: screen)
-            let isPrimary = (screen == primaryScreen)
+        overlayWindow?.close()
+        overlayWindow = nil
+    }
 
-            let overlayView = LockOverlayView(
-                appName: app.name,
-                bundleIdentifier: app.bundleIdentifier,
-                isPrimary: isPrimary,
-                onDismiss: { [weak self] in
-                    let name = self?.currentApp?.name ?? "app"
-                    self?.hide()
-                    self?.onUnlocked?(name)
-                    },
-                    onCancel: { [weak self] in
-                        self?.cancel()
-                    }
+    // MARK: - Protected Window Geometry
+
+    /// Finds the largest normal-level onscreen window owned by
+    /// the protected application.
+    ///
+    /// Quartz Window Services provides the window bounds and owner PID.
+    /// The result is converted from Quartz coordinates to AppKit
+    /// coordinates for the overlay panel.
+    private func protectedWindowFrame(
+        for protectedApp: ProtectedApp
+    ) -> NSRect? {
+
+        guard let runningApp =
+            NSWorkspace.shared.runningApplications.first(
+                where: {
+                    $0.bundleIdentifier ==
+                    protectedApp.bundleIdentifier
+                }
+            ) else {
+            return nil
+        }
+
+        guard let windowList =
+            CGWindowListCopyWindowInfo(
+                [
+                    .optionOnScreenOnly,
+                    .excludeDesktopElements
+                ],
+                kCGNullWindowID
+            ) as? [[String: Any]] else {
+            return nil
+        }
+
+        var bestRect: CGRect?
+        var bestArea: CGFloat = 0
+
+        for info in windowList {
+
+            guard
+                let ownerPID =
+                    info[kCGWindowOwnerPID as String] as? Int32,
+                ownerPID == runningApp.processIdentifier,
+
+                let layer =
+                    info[kCGWindowLayer as String] as? Int,
+                layer == 0,
+
+                let bounds =
+                    info[kCGWindowBounds as String]
+                    as? [String: Any]
+            else {
+                continue
+            }
+
+            let x =
+                (bounds["X"] as? NSNumber)?
+                    .doubleValue ?? 0
+
+            let y =
+                (bounds["Y"] as? NSNumber)?
+                    .doubleValue ?? 0
+
+            let width =
+                (bounds["Width"] as? NSNumber)?
+                    .doubleValue ?? 0
+
+            let height =
+                (bounds["Height"] as? NSNumber)?
+                    .doubleValue ?? 0
+
+            guard width > 200,
+                  height > 150 else {
+                continue
+            }
+
+            let rect = CGRect(
+                x: x,
+                y: y,
+                width: width,
+                height: height
             )
 
-            window.contentView = NSHostingView(rootView: overlayView)
-            // Don't make key or activate — system Touch ID dialog needs focus
-            window.orderFront(nil)
-            overlayWindows.append(window)
+            let area =
+                rect.width * rect.height
+
+            if area > bestArea {
+
+                bestArea = area
+                bestRect = rect
+            }
+        }
+
+        guard let quartzRect = bestRect else {
+            return nil
+        }
+
+        let screen =
+            NSScreen.main ??
+            NSScreen.screens.first
+
+        guard let screen else {
+            return nil
+        }
+
+        // Quartz uses a top-left origin for window coordinates;
+        // AppKit uses a bottom-left origin.
+        let appKitY =
+            screen.frame.maxY -
+            quartzRect.maxY
+
+        return NSRect(
+            x: quartzRect.origin.x,
+            y: appKitY,
+            width: quartzRect.width,
+            height: quartzRect.height
+        )
+    }
+
+    // MARK: - Screen Changes
+
+    @objc private func screensDidChange(
+        _ notification: Notification
+    ) {
+
+        guard let window = overlayWindow,
+              let app = currentApp else {
+            return
+        }
+
+        if let frame = protectedWindowFrame(
+            for: app
+        ) {
+            window.reposition(
+                to: frame
+            )
+            window.orderFrontRegardless()
         }
     }
 
-    // MARK: - App Window Management
+    // MARK: - Protected App Management
 
-    /// Bring the protected app to the foreground after successful auth.
-    /// Only activates if the app is already running — never launches a closed app.
-    private func activateProtectedApp(bundleIdentifier: String) {
-        guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleIdentifier }) else {
-            NSLog("[MakLock] App not running, skipping activation: %@", bundleIdentifier)
+    @discardableResult
+    private func hideProtectedApp(
+        bundleIdentifier: String
+    ) -> Bool {
+
+        guard let app =
+            NSWorkspace.shared.runningApplications.first(
+                where: {
+                    $0.bundleIdentifier ==
+                    bundleIdentifier
+                }
+            ) else {
+            return false
+        }
+
+        var hidden = app.hide()
+
+        // Accessibility fallback is only needed for Cancel.
+        if !hidden && AXIsProcessTrusted() {
+
+            let axApp =
+                AXUIElementCreateApplication(
+                    app.processIdentifier
+                )
+
+            let result =
+                AXUIElementSetAttributeValue(
+                    axApp,
+                    kAXHiddenAttribute as CFString,
+                    kCFBooleanTrue
+                )
+
+            hidden = result == .success
+        }
+
+        NSLog(
+            "[MakLock] Protected app hide requested: %@ success=%@",
+            bundleIdentifier,
+            hidden ? "YES" : "NO"
+        )
+
+        return hidden
+    }
+
+    private func activateProtectedApp(
+        bundleIdentifier: String
+    ) {
+
+        guard let app =
+            NSWorkspace.shared.runningApplications.first(
+                where: {
+                    $0.bundleIdentifier ==
+                    bundleIdentifier
+                }
+            ) else {
+
+            NSLog(
+                "[MakLock] App not running: %@",
+                bundleIdentifier
+            )
+
             return
         }
-        app.activate()
-        NSLog("[MakLock] Activated app: %@", bundleIdentifier)
+
+        _ = app.unhide()
+
+        app.activate(
+            options: [
+                .activateIgnoringOtherApps
+            ]
+        )
+
+        NSLog(
+            "[MakLock] Activated protected app: %@",
+            bundleIdentifier
+        )
     }
 
     // MARK: - Timeout
 
     private func startTimeoutTimer() {
-        let timeout = SafetyManager.isDevMode
+
+        let timeout =
+            SafetyManager.isDevMode
             ? SafetyManager.devModeTimeout
             : SafetyManager.overlayTimeout
 
-        timeoutTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
-            NSLog("[MakLock Safety] Overlay timeout reached (%.0fs) — cancelling", timeout)
-            self?.cancel()
-        }
+        timeoutTimer =
+            Timer.scheduledTimer(
+                withTimeInterval: timeout,
+                repeats: false
+            ) { [weak self] _ in
+
+                NSLog(
+                    "[MakLock Safety] Lock dialog timeout reached (%.0fs) — cancelling",
+                    timeout
+                )
+
+                self?.cancel()
+            }
     }
 
     private func stopTimeoutTimer() {
+
         timeoutTimer?.invalidate()
         timeoutTimer = nil
     }
-
 }

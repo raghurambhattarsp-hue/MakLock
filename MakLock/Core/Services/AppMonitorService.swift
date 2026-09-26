@@ -21,10 +21,17 @@ final class AppMonitorService: ObservableObject {
     /// Prevents checkRunningApps from triggering duplicate prompts.
     private var pendingLockBundleIDs: Set<String> = []
 
+    /// Previous normal-window state for each protected app.
+    private var protectedWindowState: [String: Bool] = [:]
+
+    /// Polls protected-app window state for red-X/reopen detection.
+    private var windowStateTimer: Timer?
+
     private init() {}
 
     /// Start monitoring app launches and activations.
     func startMonitoring() {
+        startWindowMonitoring()
         let workspace = NSWorkspace.shared
 
         // Monitor app launches
@@ -138,6 +145,119 @@ final class AppMonitorService: ObservableObject {
     }
 
     /// Check if an app is currently authenticated.
+    /// Cancel a pending lock without authenticating the app.
+    func cancelPendingLock(for bundleIdentifier: String) {
+        pendingLockBundleIDs.remove(bundleIdentifier)
+
+        NSLog(
+            "[MakLock] Pending lock cancelled: %@",
+            bundleIdentifier
+        )
+    }
+
+    // MARK: - Protected App Window Monitoring
+
+    private func startWindowMonitoring() {
+
+        windowStateTimer?.invalidate()
+
+        let timer = Timer(
+            timeInterval: 0.5,
+            repeats: true
+        ) { [weak self] _ in
+            self?.checkProtectedAppWindows()
+        }
+
+        windowStateTimer = timer
+
+        RunLoop.main.add(
+            timer,
+            forMode: .common
+        )
+    }
+
+    private func checkProtectedAppWindows() {
+
+        let settings =
+            Defaults.shared.appSettings
+
+        guard settings.isProtectionEnabled else {
+            return
+        }
+
+        for protectedApp in Defaults.shared.protectedApps
+            where protectedApp.isEnabled {
+
+            let bundleID =
+                protectedApp.bundleIdentifier
+
+            guard let runningApp =
+                NSWorkspace.shared.runningApplications.first(
+                    where: {
+                        $0.bundleIdentifier == bundleID
+                    }
+                ) else {
+
+                // Process is no longer running.
+                protectedWindowState[bundleID] = false
+                continue
+            }
+
+            let hasWindows =
+                appHasWindows(runningApp)
+
+            let previousState =
+                protectedWindowState[bundleID]
+
+            protectedWindowState[bundleID] =
+                hasWindows
+
+            // First observation establishes the baseline.
+            guard let previousState else {
+                continue
+            }
+
+            // --------------------------------------------
+            // Red X / last normal window closed.
+            // --------------------------------------------
+            if previousState && !hasWindows {
+
+                if authenticatedApps.contains(bundleID) {
+
+                    authenticatedApps.remove(bundleID)
+                    pendingLockBundleIDs.remove(bundleID)
+
+                    NSLog(
+                        "[MakLock] Last normal window closed, auth cleared: %@",
+                        bundleID
+                    )
+                }
+
+                continue
+            }
+
+            // --------------------------------------------
+            // Window reopened after the last one closed.
+            // --------------------------------------------
+            if !previousState,
+               hasWindows,
+               NSWorkspace.shared
+                    .frontmostApplication?
+                    .bundleIdentifier == bundleID,
+               !authenticatedApps.contains(bundleID),
+               !pendingLockBundleIDs.contains(bundleID),
+               !OverlayWindowService.shared.isShowing {
+
+                NSLog(
+                    "[MakLock] Protected app window reopened: %@",
+                    bundleID
+                )
+
+                handleAppEvent(runningApp)
+            }
+        }
+    }
+
     func isAuthenticated(_ bundleIdentifier: String) -> Bool {
         authenticatedApps.contains(bundleIdentifier)
     }

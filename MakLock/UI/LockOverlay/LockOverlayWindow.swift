@@ -1,38 +1,46 @@
 import AppKit
 
-/// Full-screen overlay panel that blocks interaction with a protected app.
-/// Uses NSPanel with .nonactivatingPanel so MakLock does NOT become the active app
-/// when the overlay is shown — this lets the system Touch ID dialog keep focus.
+/// Window-sized lock blocker.
+///
+/// The window covers only the protected application's normal window.
+/// The actual lock card inside it remains small.
 final class LockOverlayWindow: NSPanel {
-    init(for screen: NSScreen) {
+
+    init(frame: NSRect) {
         super.init(
-            contentRect: screen.frame,
-            styleMask: [.borderless, .nonactivatingPanel],
+            contentRect: frame,
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
 
-        self.level = .screenSaver
-        self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        self.isOpaque = false
-        self.backgroundColor = .clear
-        self.ignoresMouseEvents = false
-        self.hasShadow = false
-        self.isReleasedWhenClosed = false
-        self.animationBehavior = .none
-        self.hidesOnDeactivate = false
-        self.becomesKeyOnlyIfNeeded = true
+        level = .floating
+
+        collectionBehavior = [
+            .moveToActiveSpace,
+            .fullScreenAuxiliary,
+            .stationary
+        ]
+
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        isReleasedWhenClosed = false
+        animationBehavior = .none
+        hidesOnDeactivate = false
+        becomesKeyOnlyIfNeeded = false
+        ignoresMouseEvents = false
     }
 
-    /// Reposition the overlay to match the given screen frame.
-    func reposition(to screen: NSScreen) {
-        setFrame(screen.frame, display: true)
+    func reposition(to frame: NSRect) {
+        setFrame(frame, display: true)
     }
 
-    /// Whether the window should accept key status.
-    /// Disabled during Touch ID (system dialog needs focus), enabled for password input.
-    var allowKeyStatus = false
+    override var canBecomeKey: Bool {
+        true
+    }
 
-    override var canBecomeKey: Bool { allowKeyStatus }
-    override var canBecomeMain: Bool { false }
+    override var canBecomeMain: Bool {
+        false
+    }
 }
