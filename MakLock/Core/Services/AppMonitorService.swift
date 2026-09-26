@@ -66,21 +66,33 @@ final class AppMonitorService: ObservableObject {
         // Monitor app deactivation — clear auth when user quits an app that stays
         // alive in the background (e.g. Messages closes windows on Cmd+Q but process
         // survives). Does NOT clear auth on Cmd+H (hide) or simple app switch.
-        workspace.notificationCenter.publisher(for: NSWorkspace.didDeactivateApplicationNotification)
-            .compactMap { $0.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication }
-            .sink { [weak self] app in
-                guard let bundleID = app.bundleIdentifier else { return }
-                guard self?.authenticatedApps.contains(bundleID) == true else { return }
-
-                // Delay to let window close animations finish
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                    guard let self else { return }
-                    self.authenticatedApps.remove(bundleID)
-                    self.pendingLockBundleIDs.remove(bundleID)
-                    NSLog("[MakLock] App deactivated, auth cleared: %@", bundleID)
-                }
+        workspace.notificationCenter.publisher(
+            for: NSWorkspace.didDeactivateApplicationNotification
+        )
+        .compactMap {
+            $0.userInfo?[NSWorkspace.applicationUserInfoKey]
+                as? NSRunningApplication
+        }
+        .sink { [weak self] app in
+            guard let self,
+                  let bundleID = app.bundleIdentifier
+            else {
+                return
             }
-            .store(in: &cancellables)
+
+            guard self.authenticatedApps.contains(bundleID) else {
+                return
+            }
+
+            self.authenticatedApps.remove(bundleID)
+            self.pendingLockBundleIDs.remove(bundleID)
+
+            NSLog(
+                "[MakLock] App switched away, auth cleared: %@",
+                bundleID
+            )
+        }
+        .store(in: &cancellables)
 
         NSLog("[MakLock] App monitor started")
 

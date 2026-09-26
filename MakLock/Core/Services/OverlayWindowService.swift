@@ -20,7 +20,7 @@ final class OverlayWindowService {
     // MARK: - Show / Hide
 
     func show(for app: ProtectedApp) {
-        // One authentication session at a time.
+
         guard currentApp == nil else {
             return
         }
@@ -30,14 +30,16 @@ final class OverlayWindowService {
         let bundleID = app.bundleIdentifier
         let appName = app.name
 
-        // Hide the protected app BEFORE invoking the native
-        // macOS authentication UI.
+        // Capture and cover the protected window before authentication.
+        if let frame = protectedWindowFrame(for: app) {
+            createPrivacyBlocker(frame: frame)
+        }
+
+        // Also request the real application hide.
         _ = hideProtectedApp(
             bundleIdentifier: bundleID
         )
 
-        // Give macOS a moment to finish hiding the app before
-        // LAContext presents its native authentication dialog.
         DispatchQueue.main.asyncAfter(
             deadline: .now() + 0.15
         ) { [weak self] in
@@ -48,7 +50,7 @@ final class OverlayWindowService {
                 return
             }
 
-            // Retry the hide immediately before authentication.
+            // Retry the hide immediately before native authentication.
             _ = self.hideProtectedApp(
                 bundleIdentifier: bundleID
             )
@@ -71,21 +73,10 @@ final class OverlayWindowService {
                         }
 
                         switch result {
-
                         case .success:
-                            // Native authentication succeeded.
-                            // hide() will mark the session authenticated
-                            // and restore the protected application.
                             self.hide()
 
-                        case .cancelled:
-                            // User cancelled native authentication.
-                            // Keep the protected app hidden and locked.
-                            self.cancel()
-
-                        case .failure:
-                            // Authentication failed.
-                            // Do not unlock the protected app.
+                        case .cancelled, .failure:
                             self.cancel()
                         }
                     }
@@ -200,40 +191,33 @@ final class OverlayWindowService {
 
     // MARK: - Window Creation
 
-    private func createOverlayWindow(
-        for app: ProtectedApp,
-        frame: NSRect
-    ) {
+    /// Covers only the protected application's window while
+    /// native macOS authentication is active.
+    private func createPrivacyBlocker(frame: NSRect) {
 
-        let window = LockOverlayWindow(
-            frame: frame
+        let window = LockOverlayWindow(frame: frame)
+
+        let view = NSView(
+            frame: NSRect(
+                origin: .zero,
+                size: frame.size
+            )
         )
 
-        let view = LockOverlayView(
-            appName: app.name,
-            bundleIdentifier: app.bundleIdentifier,
+        view.wantsLayer = true
+        view.layer?.backgroundColor =
+            NSColor.black.withAlphaComponent(0.98).cgColor
 
-            onDismiss: { [weak self] in
+        window.contentView = view
 
-                let name =
-                    self?.currentApp?.name ?? "app"
-
-                self?.hide()
-                self?.onUnlocked?(name)
-            },
-
-            onCancel: { [weak self] in
-                self?.cancel()
-            }
-        )
-
-        window.contentView = NSHostingView(
-            rootView: view
-        )
+        // Normal level is intentional:
+        // the blocker covers WhatsApp but does not stay above
+        // another application such as Chrome after a switch.
+        window.level = .normal
+        window.ignoresMouseEvents = true
 
         overlayWindow = window
 
-        window.makeKeyAndOrderFront(nil)
         window.orderFrontRegardless()
     }
 
