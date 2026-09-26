@@ -1,38 +1,65 @@
 import AppKit
 
-/// Full-screen overlay panel that blocks interaction with a protected app.
-/// Uses NSPanel with .nonactivatingPanel so MakLock does NOT become the active app
-/// when the overlay is shown — this lets the system Touch ID dialog keep focus.
+/// Small centered lock panel.
+/// The protected application is hidden while this panel is shown,
+/// so protected content cannot remain visible behind it.
 final class LockOverlayWindow: NSPanel {
+    private let panelSize = NSSize(width: 420, height: 360)
+
     init(for screen: NSScreen) {
+        let visibleFrame = screen.visibleFrame
+
+        let origin = NSPoint(
+            x: visibleFrame.midX - panelSize.width / 2,
+            y: visibleFrame.midY - panelSize.height / 2
+        )
+
+        let frame = NSRect(
+            origin: origin,
+            size: panelSize
+        )
+
         super.init(
-            contentRect: screen.frame,
-            styleMask: [.borderless, .nonactivatingPanel],
+            contentRect: frame,
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
 
-        self.level = .screenSaver
-        self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        self.isOpaque = false
-        self.backgroundColor = .clear
-        self.ignoresMouseEvents = false
-        self.hasShadow = false
-        self.isReleasedWhenClosed = false
-        self.animationBehavior = .none
-        self.hidesOnDeactivate = false
-        self.becomesKeyOnlyIfNeeded = true
+        level = .floating
+
+        collectionBehavior = [
+            .moveToActiveSpace,
+            .fullScreenAuxiliary,
+            .stationary
+        ]
+
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = true
+        isReleasedWhenClosed = false
+        animationBehavior = .utility
+        hidesOnDeactivate = false
+        isMovableByWindowBackground = false
+        ignoresMouseEvents = false
     }
 
-    /// Reposition the overlay to match the given screen frame.
     func reposition(to screen: NSScreen) {
-        setFrame(screen.frame, display: true)
+        let visibleFrame = screen.visibleFrame
+
+        let origin = NSPoint(
+            x: visibleFrame.midX - frame.width / 2,
+            y: visibleFrame.midY - frame.height / 2
+        )
+
+        setFrameOrigin(origin)
     }
 
-    /// Whether the window should accept key status.
-    /// Disabled during Touch ID (system dialog needs focus), enabled for password input.
-    var allowKeyStatus = false
+    override var canBecomeKey: Bool {
+        true
+    }
 
-    override var canBecomeKey: Bool { allowKeyStatus }
-    override var canBecomeMain: Bool { false }
+    override var canBecomeMain: Bool {
+        false
+    }
 }

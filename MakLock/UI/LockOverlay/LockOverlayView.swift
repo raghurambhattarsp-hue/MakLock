@@ -1,31 +1,24 @@
 import SwiftUI
 
-/// The lock overlay UI: blur background with centered unlock card.
-/// Touch ID triggers automatically on appear — no user interaction needed for the happy path.
+/// Small native-style lock dialog.
+/// The protected app is hidden before this view is presented.
 struct LockOverlayView: View {
     let appName: String
     let bundleIdentifier: String
-    let isPrimary: Bool
     let onDismiss: () -> Void
     let onCancel: () -> Void
 
-    @State private var isVisible = false
     @State private var showPasswordInput = false
-    @State private var authState: AuthState = .authenticating
+    @State private var authState: AuthState = .waitingForUser
     @State private var errorMessage: String?
 
     private enum AuthState {
-        case authenticating
         case waitingForUser
+        case authenticating
     }
 
     var body: some View {
-        ZStack {
-            // Keep the overlay window itself as the invisible blocker.
-            // Only the centered lock card is visible.
-            Color.clear
-                .ignoresSafeArea()
-
+        Group {
             if showPasswordInput {
                 VStack(spacing: 12) {
                     PasswordInputView(
@@ -34,6 +27,7 @@ struct LockOverlayView: View {
                         },
                         onCancel: {
                             showPasswordInput = false
+                            authState = .waitingForUser
                         }
                     )
 
@@ -41,47 +35,58 @@ struct LockOverlayView: View {
                         onCancel()
                     }
                 }
-                .transition(.opacity)
             } else {
-                // Unlock card
-                VStack(spacing: 20) {
-                    // App icon
-                    AppIconView(bundleIdentifier: bundleIdentifier, size: 64)
+                VStack(spacing: 16) {
+                    AppIconView(
+                        bundleIdentifier: bundleIdentifier,
+                        size: 56
+                    )
 
-                    // Title
                     Text("\(appName) is Locked")
                         .font(MakLockTypography.largeTitle)
-                        .foregroundColor(MakLockColors.textPrimary)
+                        .foregroundColor(
+                            MakLockColors.textPrimary
+                        )
+                        .multilineTextAlignment(.center)
+
+                    Text("Authenticate to continue")
+                        .font(MakLockTypography.body)
+                        .foregroundColor(
+                            MakLockColors.textSecondary
+                        )
+
+                    if let errorMessage {
+                        Text(errorMessage)
+                            .font(MakLockTypography.caption)
+                            .foregroundColor(
+                                MakLockColors.error
+                            )
+                            .multilineTextAlignment(.center)
+                    }
 
                     if authState == .authenticating {
-                        // Touch ID in progress
                         ProgressView()
                             .controlSize(.regular)
-                            .padding(.top, 4)
 
                         Text("Authenticating...")
                             .font(MakLockTypography.body)
-                            .foregroundColor(MakLockColors.textSecondary)
-
-                        SecondaryButton("Cancel") {
-                            onCancel()
-                        }
+                            .foregroundColor(
+                                MakLockColors.textSecondary
+                            )
                     } else {
-                        // Touch ID failed or cancelled — show options
-                        if let errorMessage {
-                            Text(errorMessage)
-                                .font(MakLockTypography.caption)
-                                .foregroundColor(MakLockColors.error)
-                        }
-
-                        PrimaryButton("Try Again", icon: "touchid") {
+                        PrimaryButton(
+                            "Unlock with Touch ID",
+                            icon: "touchid"
+                        ) {
                             attemptTouchID()
                         }
-                        .padding(.top, 4)
 
                         SecondaryButton("Use Password Instead") {
                             OverlayWindowService.shared.enableKeyboardInput()
-                            withAnimation(MakLockAnimations.standard) {
+
+                            withAnimation(
+                                MakLockAnimations.standard
+                            ) {
                                 showPasswordInput = true
                             }
                         }
@@ -91,62 +96,52 @@ struct LockOverlayView: View {
                         }
                     }
 
-                    // Dev mode skip button
                     #if DEBUG
                     Button("Skip (Dev)") {
                         onDismiss()
                     }
                     .font(MakLockTypography.caption)
                     .foregroundColor(MakLockColors.error)
-                    .padding(.top, 8)
                     #endif
                 }
-                .padding(40)
-                .background(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(MakLockColors.cardDark)
-                        .shadow(color: .black.opacity(0.3), radius: 20, y: 8)
-                )
-                .scaleEffect(isVisible ? 1.0 : 0.9)
-                .opacity(isVisible ? 1.0 : 0.0)
-                .transition(.opacity)
             }
         }
-        .opacity(isPrimary ? 1.0 : 0.0)
-        .onAppear {
-            withAnimation(MakLockAnimations.overlayAppear) {
-                isVisible = true
-            }
-            // Only the primary screen triggers Touch ID (prevents duplicate system prompts)
-            if isPrimary {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    attemptTouchID()
-                }
-            }
-        }
+        .padding(28)
+        .frame(width: 420)
+        .background(
+            RoundedRectangle(
+                cornerRadius: 18,
+                style: .continuous
+            )
+            .fill(MakLockColors.cardDark)
+            .shadow(
+                color: .black.opacity(0.35),
+                radius: 22,
+                y: 10
+            )
+        )
     }
 
     private func attemptTouchID() {
         authState = .authenticating
         errorMessage = nil
 
-        // Lower overlay level and pass through mouse so system Touch ID dialog gets full focus
-        OverlayWindowService.shared.setTouchIDMode(true)
-
         AuthenticationService.shared.authenticateWithTouchID(
             reason: "Unlock \(appName)"
         ) { result in
-            // Restore overlay level and mouse capture
-            OverlayWindowService.shared.setTouchIDMode(false)
+            DispatchQueue.main.async {
+                switch result {
+                case .success:
+                    authState = .waitingForUser
+                    onDismiss()
 
-            switch result {
-            case .success:
-                onDismiss()
-            case .failure(let error):
-                authState = .waitingForUser
-                errorMessage = error.localizedDescription
-            case .cancelled:
-                authState = .waitingForUser
+                case .failure(let error):
+                    authState = .waitingForUser
+                    errorMessage = error.localizedDescription
+
+                case .cancelled:
+                    authState = .waitingForUser
+                }
             }
         }
     }
