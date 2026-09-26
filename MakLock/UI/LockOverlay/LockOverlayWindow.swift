@@ -38,7 +38,7 @@ final class LockOverlayWindow: NSPanel {
         backgroundColor = .clear
         hasShadow = true
         isReleasedWhenClosed = false
-        animationBehavior = .utility
+        animationBehavior = .none
         hidesOnDeactivate = false
         isMovableByWindowBackground = false
         ignoresMouseEvents = false
