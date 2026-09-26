@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import SwiftUI
 
 /// Manages the small lock dialog lifecycle.
@@ -29,12 +30,22 @@ final class OverlayWindowService {
 
         currentApp = app
 
-        hideProtectedApp(bundleIdentifier: app.bundleIdentifier)
+        // Hide the protected application BEFORE showing MakLock.
+        // This prevents its chat/content from being visible behind
+        // the authentication popup.
+        hideProtectedApp(
+            bundleIdentifier: app.bundleIdentifier
+        )
 
         createOverlayWindow(for: app)
         startTimeoutTimer()
 
-        NSApp.activate(ignoringOtherApps: true)
+        // Do NOT activate MakLock here.
+        // The popup is a non-activating panel and can be brought
+        // forward without generating another application-switch
+        // event.
+        overlayWindow?.orderFrontRegardless()
+        overlayWindow?.makeKeyAndOrderFront(nil)
 
         NSLog(
             "[MakLock] Small lock dialog shown for: %@",
@@ -185,26 +196,96 @@ final class OverlayWindowService {
 
     // MARK: - Protected App Management
 
+    // MARK: - Protected App Management
+
+    /// Hide a protected application.
+    ///
+    /// NSRunningApplication.hide() is attempted first.
+    /// If it doesn't succeed and MakLock has Accessibility trust,
+    /// use the application-level AX hidden attribute as a fallback.
+    @discardableResult
     private func hideProtectedApp(
         bundleIdentifier: String
-    ) {
+    ) -> Bool {
         guard let app =
             NSWorkspace.shared.runningApplications.first(
                 where: {
                     $0.bundleIdentifier == bundleIdentifier
                 }
             ) else {
-            return
+            return false
         }
 
-        app.hide()
+        var hidden = app.hide()
+
+        if AXIsProcessTrusted() {
+            let axApp = AXUIElementCreateApplication(
+                app.processIdentifier
+            )
+
+            let result = AXUIElementSetAttributeValue(
+                axApp,
+                kAXHiddenAttribute as CFString,
+                kCFBooleanTrue
+            )
+
+            if result == .success {
+                hidden = true
+
+                NSLog(
+                    "[MakLock] AX hidden fallback succeeded: %@",
+                    bundleIdentifier
+                )
+            }
+        }
+
+        // Retry once on the next main-run-loop turn.
+        // NSRunningApplication properties can be asynchronous.
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + 0.05
+        ) { [weak self] in
+            guard let self,
+                  let runningApp =
+                    NSWorkspace.shared.runningApplications.first(
+                        where: {
+                            $0.bundleIdentifier == bundleIdentifier
+                        }
+                    ) else {
+                return
+            }
+
+            if !runningApp.isHidden {
+                _ = runningApp.hide()
+
+                if AXIsProcessTrusted() {
+                    let axApp = AXUIElementCreateApplication(
+                        runningApp.processIdentifier
+                    )
+
+                    _ = AXUIElementSetAttributeValue(
+                        axApp,
+                        kAXHiddenAttribute as CFString,
+                        kCFBooleanTrue
+                    )
+                }
+
+                NSLog(
+                    "[MakLock] Retried hiding protected app: %@",
+                    bundleIdentifier
+                )
+            }
+        }
 
         NSLog(
-            "[MakLock] Protected app hidden: %@",
-            bundleIdentifier
+            "[MakLock] Protected app hide requested: %@ (success=%@)",
+            bundleIdentifier,
+            hidden ? "YES" : "NO"
         )
+
+        return hidden
     }
 
+    /// Unhide and activate the protected application after successful auth.
     private func activateProtectedApp(
         bundleIdentifier: String
     ) {
@@ -221,7 +302,20 @@ final class OverlayWindowService {
             return
         }
 
-        app.unhide()
+        _ = app.unhide()
+
+        if AXIsProcessTrusted() {
+            let axApp = AXUIElementCreateApplication(
+                app.processIdentifier
+            )
+
+            _ = AXUIElementSetAttributeValue(
+                axApp,
+                kAXHiddenAttribute as CFString,
+                kCFBooleanFalse
+            )
+        }
+
         app.activate()
 
         NSLog(
