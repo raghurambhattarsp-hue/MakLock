@@ -68,6 +68,29 @@ final class OverlayWindowService {
         NSLog("[MakLock] Overlay dismissed")
     }
 
+    /// Cancel the lock without authenticating the protected app.
+    /// The protected app remains unauthenticated and is hidden.
+    func cancel() {
+        stopTimeoutTimer()
+        AuthenticationService.shared.cancelAuthentication()
+
+        let bundleID = currentApp?.bundleIdentifier
+
+        overlayWindows.forEach { $0.close() }
+        overlayWindows.removeAll()
+        currentApp = nil
+
+        if let bundleID,
+           let app = NSWorkspace.shared.runningApplications.first(
+                where: { $0.bundleIdentifier == bundleID }
+           ) {
+            app.hide()
+            NSLog("[MakLock] Protected app hidden after cancel: %@", bundleID)
+        }
+
+        NSLog("[MakLock] Lock cancelled; protected app remains locked")
+    }
+
     /// Dismiss all overlays (used by panic key).
     func dismissAll() {
         hide()
@@ -137,7 +160,10 @@ final class OverlayWindowService {
                         let name = self?.currentApp?.name ?? "app"
                         self?.hide()
                         self?.onUnlocked?(name)
-                    }
+                        },
+                        onCancel: { [weak self] in
+                            self?.cancel()
+                        }
                 )
                 window.contentView = NSHostingView(rootView: overlayView)
                 window.orderFront(nil)
@@ -163,7 +189,10 @@ final class OverlayWindowService {
                     let name = self?.currentApp?.name ?? "app"
                     self?.hide()
                     self?.onUnlocked?(name)
-                }
+                    },
+                    onCancel: { [weak self] in
+                        self?.cancel()
+                    }
             )
 
             window.contentView = NSHostingView(rootView: overlayView)
@@ -194,8 +223,8 @@ final class OverlayWindowService {
             : SafetyManager.overlayTimeout
 
         timeoutTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
-            NSLog("[MakLock Safety] Overlay timeout reached (%.0fs) — auto-dismissing", timeout)
-            self?.hide()
+            NSLog("[MakLock Safety] Overlay timeout reached (%.0fs) — cancelling", timeout)
+            self?.cancel()
         }
     }
 
