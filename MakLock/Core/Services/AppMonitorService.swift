@@ -68,15 +68,9 @@ final class AppMonitorService: ObservableObject {
                 // Delay to let window close animations finish
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                     guard let self else { return }
-                    if app.isTerminated {
-                        self.authenticatedApps.remove(bundleID)
-                        self.pendingLockBundleIDs.remove(bundleID)
-                        NSLog("[MakLock] App terminated (deactivate check), auth cleared: %@", bundleID)
-                    } else if !app.isHidden && !self.appHasWindows(app) {
-                        self.authenticatedApps.remove(bundleID)
-                        self.pendingLockBundleIDs.remove(bundleID)
-                        NSLog("[MakLock] App quit (no windows), auth cleared: %@", bundleID)
-                    }
+                    self.authenticatedApps.remove(bundleID)
+                    self.pendingLockBundleIDs.remove(bundleID)
+                    NSLog("[MakLock] App deactivated, auth cleared: %@", bundleID)
                 }
             }
             .store(in: &cancellables)
