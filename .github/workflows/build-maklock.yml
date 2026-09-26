@@ -1,0 +1,57 @@
+name: Build MakLock
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: xcode-27
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcode-select -p
+
+      - name: List schemes
+        run: |
+          xcodebuild \
+            -project MakLock.xcodeproj \
+            -list
+
+      - name: Build MakLock
+        run: |
+          xcodebuild \
+            -project MakLock.xcodeproj \
+            -scheme MakLock \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Locate app
+        run: |
+          find build -name "MakLock.app" -type d -print
+
+      - name: Ad-hoc sign app
+        run: |
+          APP_PATH="$(find build -name 'MakLock.app' -type d | head -1)"
+          test -n "$APP_PATH"
+          codesign --deep --force --sign - "$APP_PATH"
+          codesign --verify --deep --strict "$APP_PATH" || true
+
+      - name: Package app
+        run: |
+          APP_PATH="$(find build -name 'MakLock.app' -type d | head -1)"
+          mkdir -p artifact
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" artifact/MakLock-modified.zip
+
+      - name: Upload MakLock
+        uses: actions/upload-artifact@v4
+        with:
+          name: MakLock-modified
+          path: artifact/MakLock-modified.zip
