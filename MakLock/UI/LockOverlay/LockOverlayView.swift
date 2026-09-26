@@ -7,6 +7,7 @@ struct LockOverlayView: View {
     let bundleIdentifier: String
     let isPrimary: Bool
     let onDismiss: () -> Void
+    let onCancel: () -> Void
 
     @State private var isVisible = false
     @State private var showPasswordInput = false
@@ -20,23 +21,26 @@ struct LockOverlayView: View {
 
     var body: some View {
         ZStack {
-            // Blur background
-            BlurView(material: .hudWindow, blendingMode: .behindWindow)
-                .ignoresSafeArea()
-
-            // Dark tint
-            Color.black.opacity(0.4)
+            // Keep the overlay window itself as the invisible blocker.
+            // Only the centered lock card is visible.
+            Color.clear
                 .ignoresSafeArea()
 
             if showPasswordInput {
-                PasswordInputView(
-                    onSuccess: {
-                        onDismiss()
-                    },
-                    onCancel: {
-                        showPasswordInput = false
+                VStack(spacing: 12) {
+                    PasswordInputView(
+                        onSuccess: {
+                            onDismiss()
+                        },
+                        onCancel: {
+                            showPasswordInput = false
+                        }
+                    )
+
+                    SecondaryButton("Cancel") {
+                        onCancel()
                     }
-                )
+                }
                 .transition(.opacity)
             } else {
                 // Unlock card
@@ -58,6 +62,10 @@ struct LockOverlayView: View {
                         Text("Authenticating...")
                             .font(MakLockTypography.body)
                             .foregroundColor(MakLockColors.textSecondary)
+
+                        SecondaryButton("Cancel") {
+                            onCancel()
+                        }
                     } else {
                         // Touch ID failed or cancelled — show options
                         if let errorMessage {
@@ -76,6 +84,10 @@ struct LockOverlayView: View {
                             withAnimation(MakLockAnimations.standard) {
                                 showPasswordInput = true
                             }
+                        }
+
+                        SecondaryButton("Cancel") {
+                            onCancel()
                         }
                     }
 
@@ -100,6 +112,7 @@ struct LockOverlayView: View {
                 .transition(.opacity)
             }
         }
+        .opacity(isPrimary ? 1.0 : 0.0)
         .onAppear {
             withAnimation(MakLockAnimations.overlayAppear) {
                 isVisible = true
