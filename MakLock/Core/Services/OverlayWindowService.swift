@@ -20,58 +20,81 @@ final class OverlayWindowService {
     // MARK: - Show / Hide
 
     func show(for app: ProtectedApp) {
-
-        guard overlayWindow == nil else {
+        // One authentication session at a time.
+        guard currentApp == nil else {
             return
         }
 
         currentApp = app
 
-        // First choice: cover the actual application window.
-        if let frame = protectedWindowFrame(for: app) {
+        let bundleID = app.bundleIdentifier
+        let appName = app.name
 
-            createOverlayWindow(
-                for: app,
-                frame: frame
-            )
+        // Hide the protected app BEFORE invoking the native
+        // macOS authentication UI.
+        _ = hideProtectedApp(
+            bundleIdentifier: bundleID
+        )
 
-        } else {
+        // Give macOS a moment to finish hiding the app before
+        // LAContext presents its native authentication dialog.
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + 0.15
+        ) { [weak self] in
 
-            // Fallback only if Quartz cannot locate the app window.
-            // Hide the app so its content cannot remain exposed.
-            hideProtectedApp(
-                bundleIdentifier: app.bundleIdentifier
-            )
-
-            guard let screen =
-                NSScreen.main ?? NSScreen.screens.first else {
-                currentApp = nil
+            guard let self,
+                  self.currentApp?.bundleIdentifier == bundleID
+            else {
                 return
             }
 
-            let size = NSSize(
-                width: 520,
-                height: 420
+            // Retry the hide immediately before authentication.
+            _ = self.hideProtectedApp(
+                bundleIdentifier: bundleID
             )
 
-            let frame = NSRect(
-                x: screen.visibleFrame.midX - size.width / 2,
-                y: screen.visibleFrame.midY - size.height / 2,
-                width: size.width,
-                height: size.height
+            NSLog(
+                "[MakLock] Starting native macOS authentication for %@",
+                appName
             )
 
-            createOverlayWindow(
-                for: app,
-                frame: frame
-            )
+            AuthenticationService.shared
+                .authenticateWithSystemFallback(
+                    reason: "Unlock \(appName)"
+                ) { [weak self] result in
+
+                    DispatchQueue.main.async {
+                        guard let self,
+                              self.currentApp?.bundleIdentifier == bundleID
+                        else {
+                            return
+                        }
+
+                        switch result {
+
+                        case .success:
+                            // Native authentication succeeded.
+                            // hide() will mark the session authenticated
+                            // and restore the protected application.
+                            self.hide()
+
+                        case .cancelled:
+                            // User cancelled native authentication.
+                            // Keep the protected app hidden and locked.
+                            self.cancel()
+
+                        case .failure:
+                            // Authentication failed.
+                            // Do not unlock the protected app.
+                            self.cancel()
+                        }
+                    }
+                }
         }
 
-        startTimeoutTimer()
-
         NSLog(
-            "[MakLock] Lock blocker shown for %@",
-            app.name
+            "[MakLock] Native authentication requested for %@",
+            appName
         )
     }
 
@@ -148,7 +171,7 @@ final class OverlayWindowService {
     }
 
     var isShowing: Bool {
-        overlayWindow != nil
+        currentApp != nil
     }
 
     var currentBundleIdentifier: String? {
