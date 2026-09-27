@@ -256,10 +256,11 @@ final class OverlayWindowService {
                 axApp,
                 kAXFocusedWindowAttribute as CFString,
                 &focused
-            ) == .success,
-               let focused = focused as! AXUIElement,
-               let frame = axWindowFrame(focused) {
-                return frame
+            ) == .success {
+                let focusedWindow = focused as! AXUIElement
+                if let frame = axWindowFrame(focusedWindow) {
+                    return frame
+                }
             }
 
             var windows: CFTypeRef?
