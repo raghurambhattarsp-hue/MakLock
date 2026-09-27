@@ -2,6 +2,9 @@ name: Build MakLock
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - v4-clean-lock-state
 
 jobs:
   build:
