@@ -1,38 +1,42 @@
 import AppKit
 
-/// Full-screen overlay panel that blocks interaction with a protected app.
-/// Uses NSPanel with .nonactivatingPanel so MakLock does NOT become the active app
-/// when the overlay is shown — this lets the system Touch ID dialog keep focus.
+/// Window-sized privacy shield. It never becomes key/main and therefore does
+/// not steal focus from Apple's native LocalAuthentication UI.
 final class LockOverlayWindow: NSPanel {
-    init(for screen: NSScreen) {
+    /// New V4 initializer.
+    init(frame: NSRect) {
         super.init(
-            contentRect: screen.frame,
+            contentRect: frame,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
 
-        self.level = .screenSaver
-        self.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-        self.isOpaque = false
-        self.backgroundColor = .clear
-        self.ignoresMouseEvents = false
-        self.hasShadow = false
-        self.isReleasedWhenClosed = false
-        self.animationBehavior = .none
-        self.hidesOnDeactivate = false
-        self.becomesKeyOnlyIfNeeded = true
+        level = .screenSaver
+        collectionBehavior = [
+            .moveToActiveSpace,
+            .fullScreenAuxiliary,
+            .stationary
+        ]
+        isOpaque = true
+        backgroundColor = .black
+        ignoresMouseEvents = false
+        hasShadow = false
+        isReleasedWhenClosed = false
+        hidesOnDeactivate = false
+        animationBehavior = .none
     }
 
-    /// Reposition the overlay to match the given screen frame.
+    /// Legacy initializer retained because the unused SwiftUI lock-overlay
+    /// source remains in the Xcode target.
+    convenience init(for screen: NSScreen) {
+        self.init(frame: screen.frame)
+    }
+
     func reposition(to screen: NSScreen) {
         setFrame(screen.frame, display: true)
     }
 
-    /// Whether the window should accept key status.
-    /// Disabled during Touch ID (system dialog needs focus), enabled for password input.
-    var allowKeyStatus = false
-
-    override var canBecomeKey: Bool { allowKeyStatus }
+    override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 }

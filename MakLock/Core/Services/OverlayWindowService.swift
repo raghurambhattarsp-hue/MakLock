@@ -1,207 +1,380 @@
 import AppKit
-import SwiftUI
 
-/// Manages overlay window lifecycle: show, hide, and timeout failsafe.
+/// Owns the single lock session and the privacy shield.
+///
+/// The shield is a window-sized, non-activating black panel placed directly
+/// over the protected application's window. It blocks mouse/keyboard access to
+/// the app without presenting any custom authentication UI. LocalAuthentication
+/// owns the actual Touch ID/password dialog.
 final class OverlayWindowService {
     static let shared = OverlayWindowService()
 
-    private var overlayWindows: [LockOverlayWindow] = []
-    private var timeoutTimer: Timer?
+    private var privacyWindow: LockOverlayWindow?
+    private var frameTimer: Timer?
+    private var retryTimer: Timer?
     private var currentApp: ProtectedApp?
+    private var sessionID = UUID()
 
-    /// Callback when overlay is dismissed after successful authentication.
-    /// Passes the name of the unlocked app.
     var onUnlocked: ((String) -> Void)?
 
-    private init() {
-        // Observe screen configuration changes (connect/disconnect monitors)
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(screensDidChange),
-            name: NSApplication.didChangeScreenParametersNotification,
-            object: nil
-        )
-    }
+    private init() {}
 
-    /// Show the lock overlay for a protected app on all screens.
     func show(for app: ProtectedApp) {
-        // Don't show duplicate overlays
-        guard overlayWindows.isEmpty else { return }
+        guard currentApp == nil else { return }
 
         currentApp = app
+        sessionID = UUID()
 
-        // Don't hide the protected app — the overlay blur covers its content,
-        // and hiding it causes macOS to reassign app focus, which interferes
-        // with the system Touch ID dialog.
+        let id = sessionID
+        let bundleID = app.bundleIdentifier
+        let name = app.name
 
-        createOverlayWindows(for: app)
-        startTimeoutTimer()
+        // The shield is created BEFORE authentication starts.
+        waitForWindow(bundleID: bundleID, attempt: 0, session: id) {
+            [weak self] in
+            guard let self,
+                  self.sessionID == id,
+                  self.currentApp?.bundleIdentifier == bundleID else {
+                return
+            }
 
-        NSLog("[MakLock] Overlay shown for: %@", app.name)
+            self.installShield(bundleID: bundleID)
+            self.startFrameTracking(bundleID: bundleID)
+            self.authenticate(bundleID: bundleID, name: name, session: id)
+        }
     }
 
-    /// Hide all overlay windows.
-    func hide() {
-        stopTimeoutTimer()
+    private func authenticate(
+        bundleID: String,
+        name: String,
+        session: UUID
+    ) {
+        guard sessionID == session,
+              currentApp?.bundleIdentifier == bundleID else { return }
 
-        // Cancel any in-progress Touch ID evaluation
-        AuthenticationService.shared.cancelAuthentication()
+        guard !AuthenticationService.shared.isAuthenticating else { return }
 
-        // Mark the app as authenticated so it won't re-lock immediately
-        if let app = currentApp {
-            AppMonitorService.shared.markAuthenticated(app.bundleIdentifier)
-        }
+        AuthenticationService.shared.authenticateWithSystemFallback(
+            reason: "Unlock (name)"
+        ) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self,
+                      self.sessionID == session,
+                      self.currentApp?.bundleIdentifier == bundleID else {
+                    return
+                }
 
-        overlayWindows.forEach { $0.close() }
-        overlayWindows.removeAll()
+                switch result {
+                case .success:
+                    self.finishUnlock(bundleID: bundleID, name: name)
 
-        // Activate the protected app now that overlays are gone.
-        // Small delay ensures overlay panels and Touch ID dialog are fully dismissed
-        // before attempting to bring the app forward.
-        if let bundleID = currentApp?.bundleIdentifier {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-                self?.activateProtectedApp(bundleIdentifier: bundleID)
+                case .cancelled, .failure:
+                    // The lock remains active. Re-open the native macOS
+                    // authentication dialog instead of exposing the app.
+                    self.retryTimer?.invalidate()
+                    self.retryTimer = Timer.scheduledTimer(
+                        withTimeInterval: 0.25,
+                        repeats: false
+                    ) { [weak self] _ in
+                        self?.authenticate(
+                            bundleID: bundleID,
+                            name: name,
+                            session: session
+                        )
+                    }
+                }
             }
+        }
+    }
+
+    private func finishUnlock(bundleID: String, name: String) {
+        retryTimer?.invalidate()
+        retryTimer = nil
+        stopFrameTracking()
+
+        AppMonitorService.shared.markAuthenticated(bundleID)
+
+        // Remove only the privacy shield. We never activate or hide the target.
+        closeShield()
+        currentApp = nil
+
+        onUnlocked?(name)
+        NSLog("[MakLock] Unlock successful: %@", bundleID)
+    }
+
+    /// Compatibility path for Watch auto-unlock.
+    func hide() {
+        guard let app = currentApp else { return }
+        finishUnlock(bundleID: app.bundleIdentifier, name: app.name)
+    }
+
+    /// Called when the user intentionally switches away while the lock dialog
+    /// is active. No authentication is granted.
+    func cancelForExternalSwitch() {
+        guard currentApp != nil else { return }
+
+        sessionID = UUID()
+        retryTimer?.invalidate()
+        retryTimer = nil
+        AuthenticationService.shared.cancelAuthentication()
+        stopFrameTracking()
+        closeShield()
+
+        if let id = currentApp?.bundleIdentifier {
+            AppMonitorService.shared.cancelPendingLock(for: id)
         }
 
         currentApp = nil
-        NSLog("[MakLock] Overlay dismissed")
     }
 
-    /// Dismiss all overlays (used by panic key).
+    func handleProtectedAppTermination() {
+        sessionID = UUID()
+        retryTimer?.invalidate()
+        retryTimer = nil
+        AuthenticationService.shared.cancelAuthentication()
+        stopFrameTracking()
+        closeShield()
+        currentApp = nil
+    }
+
     func dismissAll() {
-        hide()
+        cancelForExternalSwitch()
     }
 
-    /// Whether an overlay is currently displayed.
     var isShowing: Bool {
-        !overlayWindows.isEmpty
+        currentApp != nil
     }
 
-    /// Bundle identifier of the currently locked app (if any).
     var currentBundleIdentifier: String? {
         currentApp?.bundleIdentifier
     }
 
-    /// Display name of the currently locked app (if any).
     var currentAppName: String? {
         currentApp?.name
     }
 
-    /// During Touch ID: pass through mouse events so system dialog gets interaction.
-    /// After auth: restore mouse capture for overlay blocking.
+    // Compatibility hooks retained for the legacy SwiftUI lock view that
+    // remains in the target. V4 does not use that view for authentication.
     func setTouchIDMode(_ active: Bool) {
-        for window in overlayWindows {
-            window.ignoresMouseEvents = active
-        }
+        privacyWindow?.ignoresMouseEvents = !active
     }
 
-    /// Enable key window status on overlay windows (needed for password input).
     func enableKeyboardInput() {
-        setTouchIDMode(false)
-        for window in overlayWindows {
-            window.allowKeyStatus = true
-            window.makeKeyAndOrderFront(nil)
-        }
-        NSApp.activate(ignoringOtherApps: true)
+        // Native LocalAuthentication owns keyboard focus in V4.
     }
 
-    // MARK: - Screen Management
+    // MARK: Privacy shield
 
-    @objc private func screensDidChange(_ notification: Notification) {
-        guard !overlayWindows.isEmpty else { return }
+    private func installShield(bundleID: String) {
+        closeShield()
 
-        let screens = NSScreen.screens
+        let frame = protectedWindowFrame(bundleID: bundleID)
+            ?? NSScreen.main?.frame
+            ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
 
-        // Reposition existing windows to match current screens (don't recreate to avoid re-triggering Touch ID)
-        for (index, window) in overlayWindows.enumerated() {
-            if index < screens.count {
-                window.reposition(to: screens[index])
+        let window = LockOverlayWindow(frame: frame)
+
+        let view = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.black.cgColor
+        window.contentView = view
+
+        // Screen-saver level ensures the shield is above WhatsApp even while
+        // the native SecurityAgent dialog is presented. The panel is
+        // non-activating, so it does not steal the authentication focus.
+        window.level = .screenSaver
+        window.orderFrontRegardless()
+
+        privacyWindow = window
+    }
+
+    private func startFrameTracking(bundleID: String) {
+        stopFrameTracking()
+
+        frameTimer = Timer.scheduledTimer(
+            withTimeInterval: 0.20,
+            repeats: true
+        ) { [weak self] _ in
+            guard let self,
+                  self.currentApp?.bundleIdentifier == bundleID,
+                  let frame = self.protectedWindowFrame(bundleID: bundleID) else {
+                return
             }
-        }
 
-        // Close excess windows if screens were removed
-        while overlayWindows.count > screens.count {
-            overlayWindows.removeLast().close()
-        }
-
-        // Add new windows for new screens (only blur, no Touch ID trigger)
-        if let app = currentApp {
-            for screenIndex in overlayWindows.count..<screens.count {
-                let window = LockOverlayWindow(for: screens[screenIndex])
-                let overlayView = LockOverlayView(
-                    appName: app.name,
-                    bundleIdentifier: app.bundleIdentifier,
-                    isPrimary: false,
-                    onDismiss: { [weak self] in
-                        let name = self?.currentApp?.name ?? "app"
-                        self?.hide()
-                        self?.onUnlocked?(name)
-                    }
-                )
-                window.contentView = NSHostingView(rootView: overlayView)
-                window.orderFront(nil)
-                overlayWindows.append(window)
-            }
-        }
-
-        NSLog("[MakLock] Overlays repositioned for screen change (%d screens)", screens.count)
-    }
-
-    private func createOverlayWindows(for app: ProtectedApp) {
-        let primaryScreen = NSScreen.main ?? NSScreen.screens.first
-
-        for screen in NSScreen.screens {
-            let window = LockOverlayWindow(for: screen)
-            let isPrimary = (screen == primaryScreen)
-
-            let overlayView = LockOverlayView(
-                appName: app.name,
-                bundleIdentifier: app.bundleIdentifier,
-                isPrimary: isPrimary,
-                onDismiss: { [weak self] in
-                    let name = self?.currentApp?.name ?? "app"
-                    self?.hide()
-                    self?.onUnlocked?(name)
-                }
-            )
-
-            window.contentView = NSHostingView(rootView: overlayView)
-            // Don't make key or activate — system Touch ID dialog needs focus
-            window.orderFront(nil)
-            overlayWindows.append(window)
+            self.privacyWindow?.setFrame(frame, display: true)
+            self.privacyWindow?.orderFrontRegardless()
         }
     }
 
-    // MARK: - App Window Management
+    private func stopFrameTracking() {
+        frameTimer?.invalidate()
+        frameTimer = nil
+    }
 
-    /// Bring the protected app to the foreground after successful auth.
-    /// Only activates if the app is already running — never launches a closed app.
-    private func activateProtectedApp(bundleIdentifier: String) {
-        guard let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleIdentifier }) else {
-            NSLog("[MakLock] App not running, skipping activation: %@", bundleIdentifier)
+    private func closeShield() {
+        privacyWindow?.orderOut(nil)
+        privacyWindow?.close()
+        privacyWindow = nil
+    }
+
+    // MARK: Window geometry
+
+    private func waitForWindow(
+        bundleID: String,
+        attempt: Int,
+        session: UUID,
+        completion: @escaping () -> Void
+    ) {
+        guard sessionID == session else { return }
+
+        if protectedWindowFrame(bundleID: bundleID) != nil || attempt >= 20 {
+            completion()
             return
         }
-        app.activate()
-        NSLog("[MakLock] Activated app: %@", bundleIdentifier)
-    }
 
-    // MARK: - Timeout
-
-    private func startTimeoutTimer() {
-        let timeout = SafetyManager.isDevMode
-            ? SafetyManager.devModeTimeout
-            : SafetyManager.overlayTimeout
-
-        timeoutTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
-            NSLog("[MakLock Safety] Overlay timeout reached (%.0fs) — auto-dismissing", timeout)
-            self?.hide()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            [weak self] in
+            self?.waitForWindow(
+                bundleID: bundleID,
+                attempt: attempt + 1,
+                session: session,
+                completion: completion
+            )
         }
     }
 
-    private func stopTimeoutTimer() {
-        timeoutTimer?.invalidate()
-        timeoutTimer = nil
+    private func protectedWindowFrame(bundleID: String) -> NSRect? {
+        guard let app = runningApplication(bundleID) else { return nil }
+
+        // Accessibility gives reliable global window geometry when permission
+        // is available.
+        if AXIsProcessTrusted() {
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            var focused: CFTypeRef?
+
+            if AXUIElementCopyAttributeValue(
+                axApp,
+                kAXFocusedWindowAttribute as CFString,
+                &focused
+            ) == .success {
+                let focusedWindow = focused as! AXUIElement
+                if let frame = axWindowFrame(focusedWindow) {
+                    return frame
+                }
+            }
+
+            var windows: CFTypeRef?
+            if AXUIElementCopyAttributeValue(
+                axApp,
+                kAXWindowsAttribute as CFString,
+                &windows
+            ) == .success,
+               let windows = windows as? [AXUIElement] {
+
+                for window in windows {
+                    var minimized: CFTypeRef?
+                    let result = AXUIElementCopyAttributeValue(
+                        window,
+                        kAXMinimizedAttribute as CFString,
+                        &minimized
+                    )
+
+                    let isMinimized =
+                        result == .success &&
+                        (minimized as? NSNumber)?.boolValue == true
+
+                    if !isMinimized, let frame = axWindowFrame(window) {
+                        return frame
+                    }
+                }
+            }
+        }
+
+        return cgWindowFrame(bundleID: bundleID)
     }
 
+    private func axWindowFrame(_ window: AXUIElement) -> NSRect? {
+        var position: CFTypeRef?
+        var size: CFTypeRef?
+
+        guard AXUIElementCopyAttributeValue(
+            window, kAXPositionAttribute as CFString, &position
+        ) == .success,
+        AXUIElementCopyAttributeValue(
+            window, kAXSizeAttribute as CFString, &size
+        ) == .success else {
+            return nil
+        }
+
+        let positionAX = position as! AXValue
+        let sizeAX = size as! AXValue
+
+        var point = CGPoint.zero
+        var dimensions = CGSize.zero
+
+        guard AXValueGetValue(positionAX, .cgPoint, &point),
+              AXValueGetValue(sizeAX, .cgSize, &dimensions),
+              dimensions.width > 0,
+              dimensions.height > 0 else {
+            return nil
+        }
+
+        guard let main = NSScreen.main else { return nil }
+
+        return NSRect(
+            x: point.x,
+            y: main.frame.maxY - point.y - dimensions.height,
+            width: dimensions.width,
+            height: dimensions.height
+        )
+    }
+
+    private func cgWindowFrame(bundleID: String) -> NSRect? {
+        guard let app = runningApplication(bundleID),
+              let windows = CGWindowListCopyWindowInfo(
+                  [.optionOnScreenOnly, .excludeDesktopElements],
+                  kCGNullWindowID
+              ) as? [[String: Any]] else {
+            return nil
+        }
+
+        var best: CGRect?
+        var area: CGFloat = 0
+
+        for info in windows {
+            guard let pid = info[kCGWindowOwnerPID as String] as? Int32,
+                  pid == app.processIdentifier,
+                  let layer = info[kCGWindowLayer as String] as? Int,
+                  layer == 0,
+                  let bounds = info[kCGWindowBounds as String] as? NSDictionary else {
+                continue
+            }
+
+            var rect = CGRect.zero
+            guard CGRectMakeWithDictionaryRepresentation(bounds, &rect) else {
+                continue
+            }
+
+            let a = rect.width * rect.height
+            if a > area {
+                area = a
+                best = rect
+            }
+        }
+
+        guard let rect = best, let screen = NSScreen.main else { return nil }
+
+        return NSRect(
+            x: rect.minX,
+            y: screen.frame.maxY - rect.maxY,
+            width: rect.width,
+            height: rect.height
+        )
+    }
+
+    private func runningApplication(_ bundleID: String) -> NSRunningApplication? {
+        NSWorkspace.shared.runningApplications.first {
+            $0.bundleIdentifier == bundleID
+        }
+    }
 }
