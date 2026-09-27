@@ -2,6 +2,12 @@ name: Build MakLock
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - v5-native-auth-hide
+  pull_request:
+    branches:
+      - main
 
 jobs:
   build:

@@ -1,194 +1,280 @@
 import AppKit
 import Combine
 
-/// Monitors app launches and activations to detect when a protected app starts.
+/// Monitors protected applications and owns the lock/session state.
+///
+/// V5 deliberately does not create any overlay window. When a protected app
+/// becomes active, the app itself is hidden first, then Apple's native
+/// LocalAuthentication UI is presented. On success the app is unhidden and
+/// activated. This avoids competing with macOS focus/window management.
 final class AppMonitorService: ObservableObject {
     static let shared = AppMonitorService()
 
-    /// Published when a protected app is launched or activated.
     @Published var detectedApp: ProtectedApp?
-
-    /// Callback invoked when a protected app is detected.
     var onProtectedAppDetected: ((ProtectedApp) -> Void)?
 
     private var cancellables = Set<AnyCancellable>()
-
-    /// Apps that have been authenticated in the current session.
-    /// Cleared when the app terminates, on idle timeout, sleep, or manual clear.
     private var authenticatedApps: Set<String> = []
-
-    /// Bundle IDs that have a pending overlay prompt (not yet authenticated or cancelled).
-    /// Prevents checkRunningApps from triggering duplicate prompts.
     private var pendingLockBundleIDs: Set<String> = []
+    private var authenticatedPIDs: [String: pid_t] = [:]
+    private var visibleWindowCounts: [String: Int] = [:]
+    private var windowTimer: Timer?
 
     private init() {}
 
-    /// Start monitoring app launches and activations.
     func startMonitoring() {
-        let workspace = NSWorkspace.shared
+        stopMonitoring()
 
-        // Monitor app launches
-        workspace.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)
+        let center = NSWorkspace.shared.notificationCenter
+
+        center.publisher(for: NSWorkspace.didLaunchApplicationNotification)
             .compactMap { $0.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication }
             .sink { [weak self] app in
-                self?.handleAppEvent(app)
+                self?.handleLaunch(app)
             }
             .store(in: &cancellables)
 
-        // Monitor app activations (switching to a running protected app)
-        workspace.notificationCenter.publisher(for: NSWorkspace.didActivateApplicationNotification)
+        center.publisher(for: NSWorkspace.didActivateApplicationNotification)
             .compactMap { $0.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication }
             .sink { [weak self] app in
-                self?.handleAppEvent(app)
+                self?.handleActivation(app)
             }
             .store(in: &cancellables)
 
-        // Monitor app terminations — clear auth when a protected app quits
-        workspace.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)
+        center.publisher(for: NSWorkspace.didTerminateApplicationNotification)
             .compactMap { $0.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication }
             .sink { [weak self] app in
-                guard let bundleID = app.bundleIdentifier else { return }
-                self?.pendingLockBundleIDs.remove(bundleID)
-                if self?.authenticatedApps.contains(bundleID) == true {
-                    self?.authenticatedApps.remove(bundleID)
-                    NSLog("[MakLock] App terminated, auth cleared: %@", bundleID)
+                guard let self, let id = app.bundleIdentifier else { return }
+                self.clearAuthentication(for: id)
+                self.pendingLockBundleIDs.remove(id)
+
+                if OverlayWindowService.shared.currentBundleIdentifier == id {
+                    OverlayWindowService.shared.handleProtectedAppTermination()
                 }
             }
             .store(in: &cancellables)
 
-        // Monitor app deactivation — clear auth when user quits an app that stays
-        // alive in the background (e.g. Messages closes windows on Cmd+Q but process
-        // survives). Does NOT clear auth on Cmd+H (hide) or simple app switch.
-        workspace.notificationCenter.publisher(for: NSWorkspace.didDeactivateApplicationNotification)
-            .compactMap { $0.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication }
-            .sink { [weak self] app in
-                guard let bundleID = app.bundleIdentifier else { return }
-                guard self?.authenticatedApps.contains(bundleID) == true else { return }
+        windowTimer = Timer.scheduledTimer(withTimeInterval: 0.30, repeats: true) {
+            [weak self] _ in
+            self?.pollWindows()
+        }
 
-                // Delay to let window close animations finish
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                    guard let self else { return }
-                    self.authenticatedApps.remove(bundleID)
-                    self.pendingLockBundleIDs.remove(bundleID)
-                    NSLog("[MakLock] App deactivated, auth cleared: %@", bundleID)
-                }
-            }
-            .store(in: &cancellables)
-
-        NSLog("[MakLock] App monitor started")
-
-        // Check already-running protected apps (e.g. after MakLock restart)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.checkRunningApps()
         }
+
+        NSLog("[MakLock] V5 app monitor started")
     }
 
-    /// Scan currently running apps and trigger lock for any protected ones.
-    private func checkRunningApps() {
-        let protectedList = Defaults.shared.protectedApps
-        let settings = Defaults.shared.appSettings
-
-        NSLog("[MakLock] checkRunningApps: %d protected, protection=%@",
-              protectedList.count, settings.isProtectionEnabled ? "ON" : "OFF")
-
-        guard settings.isProtectionEnabled else { return }
-
-        let workspace = NSWorkspace.shared
-        for runningApp in workspace.runningApplications {
-            guard let bundleID = runningApp.bundleIdentifier else { continue }
-
-            if let protectedApp = protectedList.first(where: {
-                $0.bundleIdentifier == bundleID && $0.isEnabled
-            }) {
-                guard !authenticatedApps.contains(bundleID) else { continue }
-                guard !pendingLockBundleIDs.contains(bundleID) else { continue }
-                guard !OverlayWindowService.shared.isShowing else { continue }
-
-                NSLog("[MakLock] Found running protected app: %@ (%@)", protectedApp.name, bundleID)
-                detectedApp = protectedApp
-                onProtectedAppDetected?(protectedApp)
-                return // Only lock one at a time
-            }
-        }
-    }
-
-    /// Stop monitoring.
     func stopMonitoring() {
         cancellables.removeAll()
-        NSLog("[MakLock] App monitor stopped")
+        windowTimer?.invalidate()
+        windowTimer = nil
     }
 
-    /// Mark an app as authenticated. It stays unlocked until the app quits, idle, or sleep.
     func markAuthenticated(_ bundleIdentifier: String) {
+        guard let app = runningApplication(bundleIdentifier) else { return }
+
         authenticatedApps.insert(bundleIdentifier)
+        authenticatedPIDs[bundleIdentifier] = app.processIdentifier
+        visibleWindowCounts[bundleIdentifier] = visibleWindowCount(app)
         pendingLockBundleIDs.remove(bundleIdentifier)
-        NSLog("[MakLock] App session authenticated: %@", bundleIdentifier)
+
+        NSLog("[MakLock] Authenticated: %@ pid=%d",
+              bundleIdentifier, app.processIdentifier)
     }
 
-    /// Clear all authentication sessions (called on idle timeout, sleep, Watch out of range).
-    func clearAllAuthentications() {
-        authenticatedApps.removeAll()
-        pendingLockBundleIDs.removeAll()
-        NSLog("[MakLock] All app sessions cleared")
-    }
-
-    /// Clear authentication for a specific app.
     func clearAuthentication(for bundleIdentifier: String) {
         authenticatedApps.remove(bundleIdentifier)
+        authenticatedPIDs.removeValue(forKey: bundleIdentifier)
+        visibleWindowCounts.removeValue(forKey: bundleIdentifier)
+        pendingLockBundleIDs.remove(bundleIdentifier)
     }
 
-    /// Check if an app is currently authenticated.
+    func clearAllAuthentications() {
+        authenticatedApps.removeAll()
+        authenticatedPIDs.removeAll()
+        visibleWindowCounts.removeAll()
+        pendingLockBundleIDs.removeAll()
+    }
+
+    func cancelPendingLock(for bundleIdentifier: String) {
+        pendingLockBundleIDs.remove(bundleIdentifier)
+    }
+
     func isAuthenticated(_ bundleIdentifier: String) -> Bool {
         authenticatedApps.contains(bundleIdentifier)
     }
 
-    /// Check if an app has any normal-level windows (layer 0).
-    /// Returns false when an app was Cmd+Q'd but its process stayed alive.
-    private func appHasWindows(_ app: NSRunningApplication) -> Bool {
-        let pid = app.processIdentifier
-        guard let windowList = CGWindowListCopyWindowInfo(
-            [.optionAll], kCGNullWindowID
-        ) as? [[String: Any]] else {
-            return true // Assume yes if we can't query
+    private func handleLaunch(_ app: NSRunningApplication) {
+        guard let id = app.bundleIdentifier else { return }
+        clearAuthentication(for: id)
+        handleProtectedEvent(app)
+    }
+
+    private func handleActivation(_ app: NSRunningApplication) {
+        guard let activeID = app.bundleIdentifier else { return }
+
+        // MakLock itself and Apple's authentication agent are not protected-app
+        // switches. In particular, never cancel a native auth session merely
+        // because SecurityAgent becomes visible.
+        if activeID == Bundle.main.bundleIdentifier ||
+            activeID == "com.apple.SecurityAgent" ||
+            activeID == "com.apple.loginwindow" {
+            return
         }
-        return windowList.contains { info in
-            guard let windowPID = info[kCGWindowOwnerPID as String] as? Int32,
-                  let windowLayer = info[kCGWindowLayer as String] as? Int else {
-                return false
+
+        if isProtected(activeID) {
+            if let authenticatedPID = authenticatedPIDs[activeID],
+               authenticatedPID != app.processIdentifier {
+                clearAuthentication(for: activeID)
             }
-            // Layer 0 = normal window level (excludes menu extras, system UI)
-            return windowPID == pid && windowLayer == 0
+
+            handleProtectedEvent(app)
+            return
+        }
+
+        // A real switch to another normal application ends protected sessions.
+        // The currently locked app remains hidden and unauthenticated.
+        let authenticated = Array(authenticatedApps)
+        for id in authenticated {
+            clearAuthentication(for: id)
+            NSLog("[MakLock] App switch; auth cleared: %@", id)
+        }
+
+        if OverlayWindowService.shared.isShowing {
+            OverlayWindowService.shared.cancelForExternalSwitch()
         }
     }
 
-    private func handleAppEvent(_ runningApp: NSRunningApplication) {
-        guard let bundleID = runningApp.bundleIdentifier else { return }
+    private func handleProtectedEvent(_ app: NSRunningApplication) {
+        guard let id = app.bundleIdentifier,
+              isProtected(id),
+              Defaults.shared.appSettings.isProtectionEnabled,
+              !SafetyManager.isBlacklisted(id) else {
+            return
+        }
 
-        // Skip blacklisted system apps
-        guard !SafetyManager.isBlacklisted(bundleID) else { return }
+        if let authenticatedPID = authenticatedPIDs[id],
+           authenticatedPID != app.processIdentifier {
+            clearAuthentication(for: id)
+        }
 
-        // Check if this app is in the protected list
-        let protectedApps = Defaults.shared.protectedApps
-        guard let protectedApp = protectedApps.first(where: {
-            $0.bundleIdentifier == bundleID && $0.isEnabled
-        }) else { return }
+        guard !authenticatedApps.contains(id),
+              !pendingLockBundleIDs.contains(id),
+              !OverlayWindowService.shared.isShowing,
+              let protectedApp = Defaults.shared.protectedApps.first(where: {
+                  $0.bundleIdentifier == id && $0.isEnabled
+              }) else {
+            return
+        }
 
-        // Check if global protection is enabled
-        let settings = Defaults.shared.appSettings
-        guard settings.isProtectionEnabled else { return }
-
-        // Skip if app is already authenticated in this session
-        guard !authenticatedApps.contains(bundleID) else { return }
-
-        // Don't show overlay if one is already showing
-        guard !OverlayWindowService.shared.isShowing else { return }
-
-        // Don't trigger if a prompt is already pending for this app
-        guard !pendingLockBundleIDs.contains(bundleID) else { return }
-
-        NSLog("[MakLock] Protected app detected: %@ (%@)", protectedApp.name, bundleID)
-        pendingLockBundleIDs.insert(bundleID)
+        pendingLockBundleIDs.insert(id)
         detectedApp = protectedApp
         onProtectedAppDetected?(protectedApp)
+        NSLog("[MakLock] V5 lock requested: %@", id)
+    }
+
+    private func checkRunningApps() {
+        guard Defaults.shared.appSettings.isProtectionEnabled else { return }
+
+        for app in NSWorkspace.shared.runningApplications {
+            guard let id = app.bundleIdentifier,
+                  isProtected(id),
+                  !authenticatedApps.contains(id),
+                  !pendingLockBundleIDs.contains(id),
+                  !OverlayWindowService.shared.isShowing,
+                  let protectedApp = Defaults.shared.protectedApps.first(where: {
+                      $0.bundleIdentifier == id && $0.isEnabled
+                  }) else {
+                continue
+            }
+
+            pendingLockBundleIDs.insert(id)
+            detectedApp = protectedApp
+            onProtectedAppDetected?(protectedApp)
+            return
+        }
+    }
+
+    private func pollWindows() {
+        guard Defaults.shared.appSettings.isProtectionEnabled else { return }
+
+        for id in Array(authenticatedApps) {
+            guard let app = runningApplication(id) else {
+                clearAuthentication(for: id)
+                continue
+            }
+
+            guard authenticatedPIDs[id] == app.processIdentifier else {
+                clearAuthentication(for: id)
+                continue
+            }
+
+            let count = visibleWindowCount(app)
+            let previous = visibleWindowCounts[id] ?? count
+            visibleWindowCounts[id] = count
+
+            // Closing/minimizing the last window ends this authentication session.
+            if previous > 0 && count == 0 {
+                clearAuthentication(for: id)
+                NSLog("[MakLock] Last protected window closed/minimized: %@", id)
+            }
+        }
+    }
+
+    private func isProtected(_ bundleID: String) -> Bool {
+        Defaults.shared.protectedApps.contains {
+            $0.bundleIdentifier == bundleID && $0.isEnabled
+        }
+    }
+
+    private func runningApplication(_ bundleID: String) -> NSRunningApplication? {
+        NSWorkspace.shared.runningApplications.first {
+            $0.bundleIdentifier == bundleID
+        }
+    }
+
+    private func visibleWindowCount(_ app: NSRunningApplication) -> Int {
+        if AXIsProcessTrusted() {
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            var value: CFTypeRef?
+
+            if AXUIElementCopyAttributeValue(
+                axApp, kAXWindowsAttribute as CFString, &value
+            ) == .success,
+               let windows = value as? [AXUIElement] {
+
+                return windows.reduce(into: 0) { count, window in
+                    var minimized: CFTypeRef?
+                    let result = AXUIElementCopyAttributeValue(
+                        window,
+                        kAXMinimizedAttribute as CFString,
+                        &minimized
+                    )
+                    let isMinimized =
+                        result == .success &&
+                        (minimized as? NSNumber)?.boolValue == true
+                    if !isMinimized { count += 1 }
+                }
+            }
+        }
+
+        guard let windows = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return 1
+        }
+
+        return windows.reduce(into: 0) { count, info in
+            guard let pid = info[kCGWindowOwnerPID as String] as? Int32,
+                  let layer = info[kCGWindowLayer as String] as? Int,
+                  pid == app.processIdentifier,
+                  layer == 0 else {
+                return
+            }
+            count += 1
+        }
     }
 }
