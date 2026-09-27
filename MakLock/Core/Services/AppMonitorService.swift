@@ -65,18 +65,15 @@ final class AppMonitorService: ObservableObject {
                 guard let bundleID = app.bundleIdentifier else { return }
                 guard self?.authenticatedApps.contains(bundleID) == true else { return }
 
-                // Delay to let window close animations finish
+                // Clear authentication whenever the protected app is deactivated.
+                // Returning to the app will require native macOS authentication again.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
                     guard let self else { return }
-                    if app.isTerminated {
-                        self.authenticatedApps.remove(bundleID)
-                        self.pendingLockBundleIDs.remove(bundleID)
-                        NSLog("[MakLock] App terminated (deactivate check), auth cleared: %@", bundleID)
-                    } else if !app.isHidden && !self.appHasWindows(app) {
-                        self.authenticatedApps.remove(bundleID)
-                        self.pendingLockBundleIDs.remove(bundleID)
-                        NSLog("[MakLock] App quit (no windows), auth cleared: %@", bundleID)
-                    }
+
+                    self.authenticatedApps.remove(bundleID)
+                    self.pendingLockBundleIDs.remove(bundleID)
+
+                    NSLog("[MakLock] App deactivated, auth cleared: %@", bundleID)
                 }
             }
             .store(in: &cancellables)
