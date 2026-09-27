@@ -153,6 +153,16 @@ final class OverlayWindowService {
         currentApp?.name
     }
 
+    // Compatibility hooks retained for the legacy SwiftUI lock view that
+    // remains in the target. V4 does not use that view for authentication.
+    func setTouchIDMode(_ active: Bool) {
+        privacyWindow?.ignoresMouseEvents = !active
+    }
+
+    func enableKeyboardInput() {
+        // Native LocalAuthentication owns keyboard focus in V4.
+    }
+
     // MARK: Privacy shield
 
     private func installShield(bundleID: String) {
@@ -247,7 +257,7 @@ final class OverlayWindowService {
                 kAXFocusedWindowAttribute as CFString,
                 &focused
             ) == .success,
-               let focused,
+               let focused = focused as? AXUIElement,
                let frame = axWindowFrame(focused) {
                 return frame
             }
